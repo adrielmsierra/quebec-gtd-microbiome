@@ -1,0 +1,256 @@
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml">
+<head>
+<meta charset="utf-8" />
+<meta name="generator" content="pandoc" />
+<meta http-equiv="X-UA-Compatible" content="IE=EDGE" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+
+<title>Vignobles MBV Quebec</title>
+
+<!-- HTMLWidget & DataTables JS Binding -->
+<script type="text/javascript">
+(function() {
+
+HTMLWidgets.widget({
+
+  name: 'datatables',
+
+  type: 'output',
+
+  factory: function(el, width, height) {
+
+    var methods = {};
+    var selected1 = [], selected2 = [];
+    var table = null;
+
+    return {
+
+      renderValue: function(x) {
+        // ... (continued event handler code)
+        var row = table.row(this);
+        if (!row.node()) return; // ignore if row does not exist
+        
+        var rowIndex = serverRowIndex(row.index());
+        
+        // Check if row is selectable
+        if (!selDisable && selectable1.length > 0) {
+          var isNonSelectableList = selectable1[0] <= 0;
+          if (isNonSelectableList && inArray(-rowIndex, selectable1)) return;
+          if (!isNonSelectableList && !inArray(rowIndex, selectable1)) return;
+        }
+
+        if (selMode === 'single') {
+          if (inArray(rowIndex, selected1)) {
+            selected1 = [];
+          } else {
+            selected1 = [rowIndex];
+          }
+        } else if (selMode === 'multiple') {
+          if (e.shiftKey && lastClickedRow !== undefined) {
+            var range = shiftSelRowsIndex(lastClickedRow, rowIndex);
+            $.each(range, function(i, r) {
+              if (!inArray(r, selected1)) selected1.push(r);
+            });
+          } else {
+            var pos = $.inArray(rowIndex, selected1);
+            if (pos > -1) {
+              selected1.splice(pos, 1);
+            } else {
+              selected1.push(rowIndex);
+            }
+          }
+        }
+        lastClickedRow = rowIndex;
+        selectRows(true);
+        changeInput('rows_selected', selectedRows());
+      });
+
+      // Initialize table selection
+      selectRows();
+      changeInput('rows_selected', selectedRows());
+    }
+
+    // Column selection
+    if (inArray(selTarget, ['column', 'row+column'])) {
+      var selectedColumns = function() {
+        return selected2;
+      };
+
+      var selectCols = function() {
+        table.$('td.' + selClass + ', th.' + selClass).removeClass(selClass);
+        if (selected2.length === 0) return;
+        $.each(selected2, function(i, colIdx) {
+          $(table.column(colIdx).nodes()).addClass(selClass);
+          $(table.column(colIdx).header()).addClass(selClass);
+        });
+      };
+
+      table.on('click.dt', 'thead th, tbody td', function(e) {
+        var cell = table.cell(this);
+        if (!cell.node()) return;
+        var colIdx = cell.index().column;
+
+        if (selMode === 'single') {
+          selected2 = inArray(colIdx, selected2) ? [] : [colIdx];
+        } else if (selMode === 'multiple') {
+          var pos = $.inArray(colIdx, selected2);
+          if (pos > -1) {
+            selected2.splice(pos, 1);
+          } else {
+            selected2.push(colIdx);
+          }
+        }
+        selectCols();
+        changeInput('columns_selected', selectedColumns());
+      });
+
+      selectCols();
+      changeInput('columns_selected', selectedColumns());
+    }
+
+    // Cell information on click
+    table.on('click.dt', 'tbody td', function(e) {
+      var cell = table.cell(this);
+      if (!cell.node()) return;
+      var info = tweakCellIndex(cell);
+      changeInput('cell_clicked', info, 'DT.cellInfo', true, {priority: 'event'});
+    });
+
+    // Row click handler
+    table.on('click.dt', 'tbody tr', function(e) {
+      var row = table.row(this);
+      if (!row.node()) return;
+      var idx = serverRowIndex(row.index());
+      changeInput('row_clicked', idx, null, true, {priority: 'event'});
+    });
+
+  },
+
+  // Handle Shiny inputs updates from R
+  if (HTMLWidgets.shinyMode) {
+    methods.selectRows = function(rows) {
+      selected1 = $.makeArray(rows);
+      if (typeof selectRows === 'function') {
+        selectRows();
+        changeInput('rows_selected', selectedRows());
+      }
+    };
+
+    methods.selectColumns = function(cols) {
+      selected2 = $.makeArray(cols);
+      if (typeof selectCols === 'function') {
+        selectCols();
+        changeInput('columns_selected', selectedColumns());
+      }
+    };
+
+    methods.updateSearch = function(search) {
+      if (typeof search === 'string') {
+        table.search(search).draw();
+      } else if (typeof search === 'object') {
+        if (search.global !== undefined) table.search(search.global);
+        if (search.columns !== undefined) {
+          $.each(search.columns, function(i, val) {
+            searchColumn(i, val);
+          });
+        }
+        table.draw();
+      }
+    };
+
+    Shiny.addCustomMessageHandler('datatable-calls', function(data) {
+      if (data.id !== el.id) return;
+      if (methods[data.method]) {
+        methods[data.method].apply(null, data.args);
+      }
+    });
+  }
+
+},
+
+resize: function(el, width, height, instance) {
+  if (instance.fillContainer) {
+    this.fillAvailableHeight(el, height);
+  } else {
+    var table = $(el).data('datatable');
+    if (table) table.columns.adjust();
+  }
+},
+
+fillAvailableHeight: function(el, height) {
+  var $el = $(el);
+  var $table = $el.find('table');
+  var table = $el.data('datatable');
+  if (!table) return;
+
+  // Calculate height minus surrounding elements (search, pagination, info)
+  var wrapper = $el.find('.dataTables_wrapper');
+  var wrapperHeight = wrapper.outerHeight(true) - wrapper.height();
+  var otherHeight = 0;
+  
+  wrapper.children().not('.dataTables_scroll').each(function() {
+    otherHeight += $(this).outerHeight(true);
+  });
+
+  var scrollHeadHeight = $el.find('.dataTables_scrollHead').outerHeight(true) || 0;
+  var scrollFootHeight = $el.find('.dataTables_scrollFoot').outerHeight(true) || 0;
+  
+  var bodyHeight = height - wrapperHeight - otherHeight - scrollHeadHeight - scrollFootHeight;
+  
+  if (bodyHeight > 0) {
+    $el.find('.dataTables_scrollBody').css('max-height', bodyHeight + 'px').css('height', bodyHeight + 'px');
+    table.columns.adjust();
+  }
+}
+
+});
+
+})();
+</script>
+
+<style type="text/css">
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+    color: #333333;
+    padding: 20px;
+    line-height: 1.6;
+  }
+  .main-container {
+    max-width: 960px;
+    margin: 0 auto;
+  }
+  #header {
+    border-bottom: 1px solid #e5e5e5;
+    margin-bottom: 20px;
+    padding-bottom: 10px;
+  }
+  h1.title {
+    color: #2c3e50;
+  }
+  h4.author, h4.date {
+    color: #7f8c8d;
+    margin: 5px 0;
+  }
+</style>
+</head>
+
+<body>
+
+<div class="container-fluid main-container">
+
+<div id="header">
+<h1 class="title toc-ignore">Vignobles MBV Quebec</h1>
+<h4 class="author">Adriel M Sierra</h4>
+<h4 class="date">2026-10-07</h4>
+</div>
+
+<div id="overview" class="section level2">
+<h2>Overview</h2>
+<p>This interactive dashboard provides an analysis of Quebec vineyard data under the MBV (Microbiome &amp; Viticulture) framework, tracking micro-environmental traits, soil characteristics, and fungal diversity across targeted regions.</p>
+</div>
+
+</div>
+
+</body>
+</html>
