@@ -32,7 +32,7 @@ A microtable-class object containing ITS sequencing data for fungal communities.
  
 ### Scripts
 
-The file [MBV Project](Scripts) have the source code use to create the reproducible report of the data wrangling, statistical analyses and visualization.
+The file [MBV Project](Scripts/MBV_Project.Rmd) have the source code use to create the reproducible report of the data wrangling, statistical analyses and visualization.
 
 ### Report
 
