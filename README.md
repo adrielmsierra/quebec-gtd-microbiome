@@ -32,11 +32,11 @@ A microtable-class object containing ITS sequencing data for fungal communities.
  
 ### Scripts
 
-The file []() have the source code use to create the reproducible report of the data wrangling, statistical analyses and visualization.
+The file [MBV Project](MBV_Project.html) have the source code use to create the reproducible report of the data wrangling, statistical analyses and visualization.
 
 ### Report
 
-The complete reproducible report can be access here: 
+The complete reproducible report can be access here: https://adrielmsierra.github.io/quebec-gtd-microbiome/
 
 ### Data availability
 Raw sequence data were deposited in the NCBI Sequence Read Archive (SRA) with their respective accession numbers under the BioProject: .
