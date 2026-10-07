@@ -1,0 +1,1893 @@
+---
+title: "Vignobles MBV Quebec"
+author: "Adriel M Sierra"
+date: "`r Sys.Date()`"
+output: 
+  prettydoc::html_pretty:
+    theme: cayman
+    toc: true
+    toc_depth: 3
+---
+
+# **Grapevine Endosphytes & Grape trunk diseases (GTD)**
+
+This reproducible quarto document contains the complete statistical analysis, machine learning models, and ecological assembly null modeling workflows for evaluating grapevine trunk disease (GTD) effects on endophyte tissue dynamics and microbiote dysbiosis across 50 cold-climate vineyards in Québec, Canada.
+
+By integrating high-throughput amplicons sequencing (16S rRNA and ITS2) with qPCR detection of major fungal wood pathogens (*Eutypa lata* and *Diplodia seriata*), this project explores how tissue compartmentalization, management practices, and host microbiota composition are related to the emergence/occurence of grapevine trunk disease (GTDs) dieback.
+
+### Library
+
+R-packages use for the analyses
+
+```{r library, echo=TRUE, message=FALSE,  message=FALSE, warning=FALSE}
+#Library
+library(microeco)
+library(tidyverse)
+#remotes::install_github("ChiLiubio/mecodev")
+library(mecodev)
+library(stringr)
+library(ggpubr)
+library(vegan)
+library(rstatix)
+#packages for building a map
+# Install if you haven't already: install.packages(c("ggplot2", "raster", "geodata", "sf"))
+library(ggplot2)
+library(raster)
+library(sf) 
+library(geodata)
+#devtools::install_github("microsud/dysbiosisR")
+library(dysbiosisR)
+
+# packages used to build the quarto document
+library(DT)
+```
+
+```{r wd, include=FALSE,  message=FALSE, warning=FALSE}
+setwd("/Users/adrielsierra/Documents/PostDoc/INRS/Vignoable Project/Github/")
+```
+
+### Datasets
+
+Complete and processed datasets are available as a microtable object.
+
+```{r data,  message=FALSE, warning=FALSE}
+# bacteria endophyte
+MBV16S_mt = readRDS("01_MBV16S_microtable_jan26.rds")
+# fungal endophyte
+MBVITS_mt = readRDS("01_MBVITS_microtable_jan26.rds")
+```
+
+Microtables with alpha- and beta-diversity estimates included
+
+```{r estimates,  message=FALSE, warning=FALSE}
+MBV16S_mt_est <- readRDS("02_MBV16S_microtable_estimates_jan26.rds")
+MBVITS_mt_est <- readRDS("02_MBVITS_microtable_estimates_jan26.rds")
+MBV16S_alpha = readRDS("02_MBVBacterial_alphadiv.rds")
+MBVITS_alpha = readRDS("02_MBVFungal_alphadiv.rds")
+```
+
+Dysbiosis score
+
+```{r dysbiosisdata,  message=FALSE, warning=FALSE}
+#datasets
+dysbiosis_results_bacteria <- readRDS("03_DysbiosisBacteriaResults.rds")
+dysbiosis_results_fungi <- readRDS("03_DysbiosisFungiResults.rds")
+```
+
+### Sampling design
+
+A table include all the metadata associated for each sample.
+
+Samples for Bacteria 16S amplicon-sequencing.
+
+```{r sample16S,  message=FALSE, warning=FALSE}
+DT::datatable(MBV16S_mt$sample_table)
+```
+
+Samples for Fungal ITS2 amplicon-sequencing
+
+```{r sampleITS,  message=FALSE, warning=FALSE}
+DT::datatable(MBV16S_mt$sample_table)
+```
+
+#### Map of vineyards analyzed across Québec
+
+```{r}
+# Map of vignobles
+
+# Canada-wide boundary data (Level 1 = provinces/territories)
+geodata_path("~/geodata")
+canada_sp <- gadm(country = "CAN", level = 2)
+
+# Filter for Quebec (assuming 'NAME_1' is the province name column)
+quebec_sp <- subset(canada_sp, canada_sp$NAME_1 == "Québec")
+
+# Convert to sf object for ggplot (optional but recommended)
+quebec_sf <- st_as_sf(quebec_sp)
+MBV16S_sampledata.envi <- MBV16S_mt$sample_table
+
+MBV16S_sampledata.envi$Infected <- as.factor(
+  str_replace_all(
+    MBV16S_sampledata.envi$Pathologie,
+    c(
+      "Diplodia.seriata" = "Infected",
+      "Eutypa.lata" = "Infected",
+      "Eutypa.lata_Diplodia.seriata" = "Infected"
+    )
+  )
+)
+#levels(MBV16S_sampledata.envi$Infected) <- c("Healthy", "Infected", "Infected")
+
+# plot map of all vineyards classified by symptomatic infections
+ggplot() +
+  geom_sf(data = quebec_sf, fill = "lightyellow", color = "black") +
+  coord_sf(xlim = c(-80, -70), ylim = c(44.8, 47.5), expand = FALSE)+
+  geom_point(data = MBV16S_sampledata.envi,                   # Specify the points data
+             aes(x = Longitude.GPS, y = Latitude.GPS, shape = Infected, alpha = Infected, color = Pathologie), # Map aesthetics for points
+             size = 3)+
+  geom_jitter()+
+  scale_color_manual(values = c("#1B9E77",  "#D95F02",  "#7570B3",  "NA"))+
+  scale_alpha_manual(values = c("Healthy" = 0.2, "Infected" = 0.60))+
+  labs(title = "Map of Québec") +
+  theme_minimal()
+```
+
+### Taxonomic tables
+
+#### Bacterial endophyte taxonomy
+
+```{r btax,  message=FALSE, warning=FALSE}
+bgenus_freq = sort(table((MBV16S_mt$tax_table)[, "Genus"], exclude = NULL), decreasing = TRUE)
+
+top_bgenera <- names(bgenus_freq)[1:20]
+
+tax_df <- as.data.frame(MBV16S_mt$tax_table)
+
+tax_top_bgenera <- tax_df[tax_df$Genus %in% top_bgenera, ]
+
+#collapse by one row per genus
+tax_top_bgenera_unique <- tax_top_bgenera |>
+  dplyr::select(Phylum, Class, Order, Family, Genus) |>
+  dplyr::distinct()
+
+#final table with frequencies
+bacteria_final_table <- tax_top_bgenera_unique |>
+  dplyr::left_join(
+    data.frame(
+      Genus = names(bgenus_freq),
+      Frequency = as.numeric(bgenus_freq)
+    ),
+    by = "Genus"
+  ) |>
+  dplyr::arrange(desc(Frequency))
+
+DT::datatable(bacteria_final_table)
+
+```
+
+#### Fungal endophyte taxonomy
+
+```{r ftax}
+fgenus_freq = sort(table((MBVITS_mt$tax_table)[, "Genus"], exclude = NULL), decreasing = TRUE)
+
+top_fgenera <- names(fgenus_freq)[1:20]
+
+ftax_df <- as.data.frame(MBVITS_mt$tax_table)
+
+tax_top_fgenera <- ftax_df[ftax_df$Genus %in% top_fgenera, ]
+
+#collapse by one row per genus
+tax_top_fgenera_unique <- tax_top_fgenera |>
+  dplyr::select(Phylum, Class, Order, Family, Genus) |>
+  dplyr::distinct()
+
+#final table with frequencies
+fungal_final_table <- tax_top_fgenera_unique |>
+  dplyr::left_join(
+    data.frame(
+      Genus = names(fgenus_freq),
+      Frequency = as.numeric(fgenus_freq)
+    ),
+    by = "Genus"
+  ) |>
+  dplyr::arrange(desc(Frequency))
+
+DT::datatable(fungal_final_table)
+
+```
+
+### Data exploration
+
+#### Abundance differences endophyte across vineyards
+
+-   Bacterial endophyte
+
+```{r bactabun,  message=FALSE, warning=FALSE, message=FALSE, results = 'hide'}
+
+# Variables plus important
+#Annee.de.plantation	Mode.de.conduite	Periode.de.taille	Tissu
+# Relative abundance
+MBV16S_abunf <- trans_abund$new(dataset = MBV16S_mt, taxrank = "Family", ntaxa = 6)
+MBV16S_abung <- trans_abund$new(dataset = MBV16S_mt, taxrank = "Genus")
+
+# line plot by year planted
+A_MBV16S_abunf <- trans_abund$new(dataset = MBV16S_mt, taxrank = "Family", ntaxa = 5, groupmean = "Annee.de.plantation")
+A_MBV16S_abunf$data_abund <- A_MBV16S_abunf$data_abund %>%
+  dplyr::filter(!is.na(Sample))
+A_MBV16S_abun <- trans_abund$new(dataset = MBV16S_mt, taxrank = "Genus", ntaxa = 6, groupmean = "Annee.de.plantation")
+A_MBV16S_abun$data_abund <- A_MBV16S_abun$data_abund %>%
+  dplyr::filter(Sample != "NA",
+                Taxonomy != "NA")
+# vineyards sample tissue
+B_MBV16S_abunf <- trans_abund$new(dataset = MBV16S_mt, taxrank = "Family", ntaxa = 5, groupmean = "Tissu")
+B_MBV16S_abun <- trans_abund$new(dataset = MBV16S_mt, taxrank = "Genus", ntaxa = 6, groupmean = "Tissu")
+B_MBV16S_abun$data_abund <- B_MBV16S_abun$data_abund %>%
+  dplyr::filter(Taxonomy != "NA")
+# vineyards training system
+C_MBV16S_abunf <- trans_abund$new(dataset = MBV16S_mt, taxrank = "Family", ntaxa = 5, groupmean = "Mode.de.conduite")
+C_MBV16S_abun <- trans_abund$new(dataset = MBV16S_mt, taxrank = "Genus", ntaxa = 6, groupmean = "Mode.de.conduite")
+C_MBV16S_abun$data_abund <- C_MBV16S_abun$data_abund %>%
+  dplyr::filter(Taxonomy != "NA")
+# vineyards pruning season
+D_MBV16S_abunf <- trans_abund$new(dataset = MBV16S_mt, taxrank = "Family", ntaxa = 5, groupmean = "Periode.de.taille")
+D_MBV16S_abunf$data_abund <- D_MBV16S_abunf$data_abund %>%
+  dplyr::filter(Sample != "")
+D_MBV16S_abun <- trans_abund$new(dataset = MBV16S_mt, taxrank = "Genus", ntaxa = 6, groupmean = "Periode.de.taille")
+D_MBV16S_abun$data_abund <- D_MBV16S_abun$data_abund %>%
+  dplyr::filter(Sample != "",
+                Taxonomy != "NA")
+
+# Kruskal Wallis test genus tissue
+kw_results <- MBV16S_abunf$data_abund %>%   
+  group_by(Taxonomy) %>%
+  kruskal_test(Abundance ~ Tissu)
+#correct multiple testing
+kw_results <- kw_results %>%
+  mutate(p_adj = p.adjust(p, method = "BH"))
+#add significance labels
+kw_results <- kw_results %>%
+  mutate(p.signif = case_when(
+    p_adj <= 0.001 ~ "***",
+    p_adj <= 0.01  ~ "**",
+    p_adj <= 0.05  ~ "*",
+    TRUE           ~ "ns"
+  ))
+
+#
+#posthoc <- MBV16S_abunf$data_abund %>%   
+#  group_by(Taxonomy) %>%
+#  pairwise_wilcox_test(
+#    Abundance ~ Tissu,
+#    p.adjust.method = "BH", na.rm = TRUE)
+
+# line plots
+ggarrange(A_MBV16S_abunf$plot_line()+
+  theme_classic()+ theme(axis.text.x = element_text(angle = 90, vjust = 0.5))+
+  theme(text = element_text(size = 14)), C_MBV16S_abunf$plot_line()+
+    theme_classic()+ theme(axis.text.x = element_text(angle = 15, vjust = 0.5))+
+    theme(text = element_text(size = 14)), B_MBV16S_abunf$plot_line()+
+    theme_classic()+ theme(axis.text.x = element_text(angle = 15, vjust = 0.5))+
+    theme(text = element_text(size = 14)), D_MBV16S_abunf$plot_line()+
+    theme_classic()+ theme(axis.text.x = element_text(angle = 15, vjust = 0.5))+
+    theme(text = element_text(size = 14)), ncol= 2, nrow = 2, common.legend = TRUE, legend = "right")
+
+ggarrange(A_MBV16S_abun$plot_line()+
+            theme_classic()+ theme(axis.text.x = element_text(angle = 90, vjust = 0.5))+
+            theme(text = element_text(size = 14)), C_MBV16S_abun$plot_line()+
+            theme_classic()+ theme(axis.text.x = element_text(angle = 15, vjust = 0.5))+
+            theme(text = element_text(size = 14)), B_MBV16S_abun$plot_line()+
+            theme_classic()+ theme(axis.text.x = element_text(angle = 15, vjust = 0.5))+
+            theme(text = element_text(size = 14)), D_MBV16S_abun$plot_line()+
+            theme_classic()+ theme(axis.text.x = element_text(angle = 15, vjust = 0.5))+
+            theme(text = element_text(size = 14)), ncol= 2, nrow = 2, common.legend = TRUE, legend = "right")
+
+# Infected plants
+
+Pathos_MBV16S_abunf <- trans_abund$new(dataset = MBV16S_mt, taxrank = "Family", ntaxa = 5, groupmean = "Pathologie")
+Pathos_MBV16S_abunf$data_abund <- Pathos_MBV16S_abunf$data_abund %>%
+  dplyr::filter(Sample != "Eutypa.lata_Diplodia.seriata",
+                Taxonomy != "NA")
+
+Pathos_MBV16S_abung <- trans_abund$new(dataset = MBV16S_mt, taxrank = "Genus", ntaxa = 6, groupmean = "Pathologie")
+Pathos_MBV16S_abung$data_abund <- Pathos_MBV16S_abung$data_abund %>%
+  dplyr::filter(Sample != "Eutypa.lata_Diplodia.seriata",
+                Taxonomy != "NA")
+
+ggarrange(Pathos_MBV16S_abunf$plot_line()+
+            theme_classic()+ theme(axis.text.x = element_text(angle = 0, vjust = 0.5))+
+            theme(text = element_text(size = 14)), Pathos_MBV16S_abung$plot_line()+
+            theme_classic()+ theme(axis.text.x = element_text(angle = 0, vjust = 0.5))+
+            theme(text = element_text(size = 14)), ncol= 1, nrow = 2)
+
+```
+
+-   Fungal endophyte
+
+```{r vineabun,  message=FALSE, warning=FALSE, message=FALSE, results = 'hide'}
+# Sum sample coverage
+MBVITS_mt$sample_table$coverage = MBVITS_mt$sample_sums()
+
+# Relative abundance
+MBVITS_abunf <- trans_abund$new(dataset = MBVITS_mt, taxrank = "Family")
+MBVITS_abung <- trans_abund$new(dataset = MBVITS_mt, taxrank = "Genus")
+
+# line plot by year planted
+# vineyard year of plantation
+A_MBVITS_abunf <- trans_abund$new(dataset = MBVITS_mt, taxrank = "Family", ntaxa = 5, groupmean = "Annee.de.plantation")
+A_MBVITS_abunf$data_abund <- A_MBVITS_abunf$data_abund %>%
+  dplyr::filter(!is.na(Sample),
+                Taxonomy != "NA")
+A_MBVITS_abun <- trans_abund$new(dataset = MBVITS_mt, taxrank = "Genus", ntaxa = 6, groupmean = "Annee.de.plantation")
+A_MBVITS_abun$data_abund <- A_MBVITS_abun$data_abund %>%
+  dplyr::filter(Sample != "NA",
+                Taxonomy != "NA")
+# Plant tissue
+B_MBVITS_abunf <- trans_abund$new(dataset = MBVITS_mt, taxrank = "Family", ntaxa = 5, groupmean = "Tissu")
+B_MBVITS_abun <- trans_abund$new(dataset = MBVITS_mt, taxrank = "Genus", ntaxa = 6, groupmean = "Tissu")
+B_MBVITS_abun$data_abund <- B_MBVITS_abun$data_abund %>%
+  dplyr::filter(Taxonomy != "NA")
+# vineyard training system
+C_MBVITS_abunf <- trans_abund$new(dataset = MBVITS_mt, taxrank = "Family", ntaxa = 5, groupmean = "Mode.de.conduite")
+C_MBVITS_abun <- trans_abund$new(dataset = MBVITS_mt, taxrank = "Genus", ntaxa = 6, groupmean = "Mode.de.conduite")
+C_MBVITS_abun$data_abund <- C_MBVITS_abun$data_abund %>%
+  dplyr::filter(Taxonomy != "NA")
+# vineyard pruning season
+D_MBVITS_abunf <- trans_abund$new(dataset = MBVITS_mt, taxrank = "Family", ntaxa = 5, groupmean = "Periode.de.taille")
+D_MBVITS_abunf$data_abund <- D_MBVITS_abunf$data_abund %>%
+  dplyr::filter(Sample != "")
+D_MBVITS_abun <- trans_abund$new(dataset = MBVITS_mt, taxrank = "Genus", ntaxa = 6, groupmean = "Periode.de.taille")
+D_MBVITS_abun$data_abund <- D_MBVITS_abun$data_abund %>%
+  dplyr::filter(Sample != "",
+                Taxonomy != "NA")
+
+
+
+# Kruskal Wallis test genus tissue
+kw_results <- MBVITS_abunf$data_abund %>%   
+  group_by(Taxonomy) %>%
+  kruskal_test(Abundance ~ Sample)
+#correct multiple testing
+kw_results <- kw_results %>%
+  mutate(p_adj = p.adjust(p, method = "BH"))
+#add significance labels
+kw_results <- kw_results %>%
+  mutate(p.signif = case_when(
+    p_adj <= 0.001 ~ "***",
+    p_adj <= 0.01  ~ "**",
+    p_adj <= 0.05  ~ "*",
+    TRUE           ~ "ns"
+  ))
+
+# post hot test
+#posthoc <- MBVITS_abunf$data_abund %>%   
+#  group_by(Taxonomy) %>%
+#  pairwise_wilcox_test(
+#    Abundance ~ Sample,
+#    p.adjust.method = "BH")
+
+#check abundance distribution of significant taxa
+ggarrange(A_MBVITS_abunf$plot_line()+
+            theme_classic()+ theme(axis.text.x = element_text(angle = 90, vjust = 0.5))+
+            theme(text = element_text(size = 14)), C_MBVITS_abunf$plot_line()+
+            theme_classic()+ theme(axis.text.x = element_text(angle = 15, vjust = 0.5))+
+            theme(text = element_text(size = 14)), B_MBVITS_abunf$plot_line()+
+            theme_classic()+ theme(axis.text.x = element_text(angle = 15, vjust = 0.5))+
+            theme(text = element_text(size = 14)), D_MBVITS_abunf$plot_line()+
+            theme_classic()+ theme(axis.text.x = element_text(angle = 15, vjust = 0.5))+
+            theme(text = element_text(size = 14)), ncol= 2, nrow = 2, common.legend = TRUE, legend = "right")
+
+ggarrange(A_MBVITS_abun$plot_line()+
+            theme_classic()+ theme(axis.text.x = element_text(angle = 90, vjust = 0.5))+
+            theme(text = element_text(size = 14)), C_MBVITS_abun$plot_line()+
+            theme_classic()+ theme(axis.text.x = element_text(angle = 15, vjust = 0.5))+
+            theme(text = element_text(size = 14)), B_MBVITS_abun$plot_line()+
+            theme_classic()+ theme(axis.text.x = element_text(angle = 15, vjust = 0.5))+
+            theme(text = element_text(size = 14)), D_MBVITS_abun$plot_line()+
+            theme_classic()+ theme(axis.text.x = element_text(angle = 15, vjust = 0.5))+
+            theme(text = element_text(size = 14)), ncol= 2, nrow = 2, common.legend = TRUE, legend = "right")
+
+# Infected plants
+
+Pathos_MBVITS_abunf <- trans_abund$new(dataset = MBVITS_mt, taxrank = "Family", ntaxa = 5, groupmean = "Pathologie")
+Pathos_MBVITS_abunf$data_abund <- Pathos_MBVITS_abunf$data_abund %>%
+  dplyr::filter(Sample != "Eutypa.lata_Diplodia.seriata",
+                Taxonomy != "NA")
+
+Pathos_MBVITS_abung <- trans_abund$new(dataset = MBVITS_mt, taxrank = "Genus", ntaxa = 6, groupmean = "Pathologie")
+Pathos_MBVITS_abung$data_abund <- Pathos_MBVITS_abung$data_abund %>%
+  dplyr::filter(Sample != "Eutypa.lata_Diplodia.seriata",
+                Taxonomy != "NA")
+
+ggarrange(Pathos_MBVITS_abunf$plot_line()+
+            theme_classic()+ theme(axis.text.x = element_text(angle = 0, vjust = 0.5))+
+            theme(text = element_text(size = 14)), Pathos_MBVITS_abung$plot_line()+
+            theme_classic()+ theme(axis.text.x = element_text(angle = 0, vjust = 0.5))+
+            theme(text = element_text(size = 14)), ncol= 1, nrow = 2)
+
+```
+
+### Alpha-diversity
+
+General script for alpha diversity estimates
+
+```{r alpha, eval=FALSE, message=FALSE,  message=FALSE, warning=FALSE}
+# Diversity 
+### Alpha diversity general 
+set.seed(6565)
+
+# general script to estimate diversity index for bacterial and fungal endophytes using Hill numbers
+MBV_alpha <- trans_alpha$new(dataset = MBV_mt, group = "Tissu", by_group = "Infected", by_ID = "Echantillon")# group by tissue sampled
+# transform taxa occurence to relative abundance
+MBV_mt_norm <- microbiome::transform(MBV_mt$otu_table, transform = "compositional")
+
+###alpha diversity
+#observe species hill numbers
+hillq0 <- subset(MBV_alpha$data_alpha, MBV_alpha$data_alpha$Measure == "Observed")
+
+# Shannon 
+shannon.hill <- exp(vegan::diversity(t(MBV_mt_norm), index = "shannon"))
+
+# Simpson
+simpson.hill <- 1/(1-(vegan::diversity(t(MBV_mt_norm), index = "simpson")))
+```
+
+The Shapiro-Wilk test and histogram visualization to check for diversity estimates are normal distributed.
+
+-   Bacteria
+
+```{r, results = 'hide', message=FALSE,  message=FALSE, warning=FALSE}
+# Statistics of both bacteria and fungi
+# check for normality with histrogram
+ggarrange(gghistogram(subset(MBV16S_alpha$data_alpha, MBV16S_alpha$data_alpha$Measure == "Observed"), "Value", y = "count", fill = "Measure",
+            add = "mean"),
+gghistogram(subset(MBV16S_alpha$data_alpha, MBV16S_alpha$data_alpha$Measure == "Shannon_hill"), "Value", y = "count", fill = "Measure",
+            add = "mean"),
+gghistogram(subset(MBV16S_alpha$data_alpha, MBV16S_alpha$data_alpha$Measure == "Simpson_hill"), "Value", y = "count", fill = "Measure",
+            add = "mean"), nrow = 1, ncol = 3)
+
+#Bacteria
+#data.frame(shapiro.test(subset(MBV16S_alpha$data_alpha, MBV16S_alpha$data_alpha$Measure == "Observed")[,3])[1:4],
+#shapiro.test(subset(MBV16S_alpha$data_alpha, MBV16S_alpha$data_alpha$Measure == "Shannon_hill")[,3])[1:4],
+#shapiro.test(subset(MBV16S_alpha$data_alpha, MBV16S_alpha$data_alpha$Measure == "Simpson_hill")[,3])[1:4])
+```
+
+-   Fungi
+
+```{r, results = 'hide', message=FALSE,  message=FALSE, warning=FALSE }
+### Fungi
+ggarrange(gghistogram(subset(MBVITS_alpha$data_alpha, MBVITS_alpha$data_alpha$Measure == "Observed"), "Value", y = "count", fill = "Measure",
+            add = "mean"),
+gghistogram(subset(MBVITS_alpha$data_alpha, MBVITS_alpha$data_alpha$Measure == "Shannon_hill"), "Value", y = "count", fill = "Measure",
+            add = "mean"),
+gghistogram(subset(MBVITS_alpha$data_alpha, MBVITS_alpha$data_alpha$Measure == "Simpson_hill"), "Value", y = "count", fill = "Measure",
+            add = "mean"), nrow = 1, ncol = 3)
+
+#data.frame(shapiro.test(subset(MBVITS_alpha$data_alpha, MBVITS_alpha$data_alpha$Measure == "Observed")[,3])[1:4],
+#                     shapiro.test(subset(MBVITS_alpha$data_alpha, MBVITS_alpha$data_alpha$Measure == "Shannon_hill")[,3])[1:4],
+#                     shapiro.test(subset(MBVITS_alpha$data_alpha, MBVITS_alpha$data_alpha$Measure == "Simpson_hill")[,3])[1:4])
+```
+
+#### Alpha-diversity statistical analyses
+
+```{r, results = 'hide', message=FALSE,  message=FALSE, warning=FALSE}
+# Alpha diversity summary statistics
+########
+# estimate mean and standard deviation for groups
+data_summary <- function(data, varname, groupnames){
+  require(plyr)
+  summary_func <- function(x, col){
+    c(mean = mean(x[[col]], na.rm=TRUE),
+      sd = sd(x[[col]], na.rm=TRUE))
+  }
+  data_sum<-ddply(data, groupnames, .fun=summary_func,
+                  varname)
+  data_sum <- rename(data_sum, c("mean" = varname))
+  return(data_sum)
+}   
+
+#
+Bacterialmeandiv = data.frame(dfrich.obs.b <- data_summary(subset(MBV16S_alpha$data_alpha, MBV16S_alpha$data_alpha$Measure == "Observed"), varname="Value", groupnames=c("Annee.echantillonnage.fact", "Tissu", "Infected")),
+                           dfrich.sha.b <- data_summary(subset(MBV16S_alpha$data_alpha, MBV16S_alpha$data_alpha$Measure == "Shannon_hill"), varname="Value", groupnames=c("Annee.echantillonnage.fact", "Tissu", "Infected")),
+                           dfrich.simp.b <- data_summary(subset(MBV16S_alpha$data_alpha, MBV16S_alpha$data_alpha$Measure == "Simpson_hill"), varname="Value", groupnames=c("Annee.echantillonnage.fact", "Tissu", "Infected")))
+
+Fungalmeandiv = data.frame(dfrich.obs.plot <- data_summary(subset(MBVITS_alpha$data_alpha, MBVITS_alpha$data_alpha$Measure == "Observed"), varname="Value", groupnames=c("Annee.echantillonnage.fact", "Tissu", "Infected")),
+                     dfrich.sha.plot <- data_summary(subset(MBVITS_alpha$data_alpha, MBVITS_alpha$data_alpha$Measure == "Shannon_hill"), varname="Value", groupnames=c("Annee.echantillonnage.fact", "Tissu", "Infected")),
+                     dfrich.simp.plot <- data_summary(subset(MBVITS_alpha$data_alpha, MBVITS_alpha$data_alpha$Measure == "Simpson_hill"), varname="Value", groupnames=c("Annee.echantillonnage.fact", "Tissu", "Infected")))
+
+
+summary(glm(Value~Tissu*Infected, family = Gamma(link = "log"), data=subset(MBV16S_alpha$data_alpha, MBV16S_alpha$data_alpha$Measure == "Observed")))
+summary(glm(Value~Tissu*Infected, family = Gamma(link = "log"), data=subset(MBV16S_alpha$data_alpha, MBV16S_alpha$data_alpha$Measure == "Shannon_hill")))
+summary(glm(Value~Tissu*Infected, family = Gamma(link = "log"), data=subset(MBV16S_alpha$data_alpha, MBV16S_alpha$data_alpha$Measure == "Simpson_hill")))
+
+summary(glm(Value~Tissu*Infected, family = Gamma(link = "log"), data=subset(MBVITS_alpha$data_alpha, MBVITS_alpha$data_alpha$Measure == "Observed")))
+summary(glm(Value~Tissu*Infected, family = Gamma(link = "log"), data=subset(MBVITS_alpha$data_alpha, MBVITS_alpha$data_alpha$Measure == "Shannon_hill")))
+summary(glm(Value~Tissu*Infected, family = Gamma(link = "log"), data=subset(MBVITS_alpha$data_alpha, MBVITS_alpha$data_alpha$Measure == "Simpson_hill")))
+```
+
+#### Visualize alpha-diversity
+
+```{r, results = 'hide',  message=FALSE, warning=FALSE }
+
+#Visualize
+#bacteria
+library(introdataviz)
+library(devtools)
+#devtools::install_github("psyteachr/introdataviz")
+library(purrr)
+library(emmeans)
+library(multcomp)
+
+
+div_measures <- c("Observed", "Shannon_hill", "Simpson_hill")
+levels(MBV16S_alpha$data_alpha$Tissu) = c("Ecorce.Chancre", "Courson.Sarment","Cordon")
+
+plot_list_bacteria <- list()
+
+for (measure in div_measures) {
+    
+    df_sub <- MBV16S_alpha$data_alpha %>%
+      filter(Measure == measure)
+  # ---- Fit GLM ----
+  model <- glm(Value ~ Tissu * Infected,
+               data = df_sub,
+               family = Gamma(link = "log"))
+  
+  # ---- Estimated marginal means ----
+  emm <- emmeans(model, ~ Tissu * Infected)
+  
+  # ---- Compact letter display ----
+  cld_res <- multcomp::cld(emm, Letters = letters) %>%
+    as.data.frame()
+  cld_res$maxval = max(df_sub$Value)
+  # ---- Plot ----
+  p <- ggplot(df_sub,
+              aes(x = Tissu,
+                  y = Value,
+                  fill = Infected)) +
+    
+    geom_violin(trim = FALSE) +
+    
+    geom_jitter(position = position_jitterdodge(
+                  dodge.width = 0.8,
+                  jitter.width = 0.6),
+                size = 1.5) +
+    
+    geom_text(data = cld_res,
+              aes(x = Tissu,
+                  y = maxval+100,
+                  label = .group,
+                  group = Infected),
+              position = position_dodge(0.8),
+              inherit.aes = FALSE,
+              size = 5) +
+    labs(x = "Vine tissue",
+         y = measure,
+         title = measure) +
+    scale_fill_brewer(palette = "Accent") +
+    theme_classic() +
+    theme(text = element_text(size = 14))
+  
+  plot_list_bacteria[[measure]] <- p
+}
+
+plot_list_bacteria[[1]]
+plot_list_bacteria[[2]]
+plot_list_bacteria[[3]]
+
+### plot fungi
+MBVITS_alpha_sub <- NULL
+MBVITS_alpha_sub$data_alpha <- MBVITS_alpha$data_alpha %>%
+  filter(Tissu != "Racine")
+
+plot_list_fungi <- list()
+for (measure in div_measures) {
+  
+  df_sub <- MBVITS_alpha_sub$data_alpha %>%
+    filter(Measure == measure)
+  # ---- Fit GLM ----
+  model <- glm(Value ~ Tissu * Infected,
+               data = df_sub,
+               family = Gamma(link = "log"))
+  
+  # ---- Estimated marginal means ----
+  emm <- emmeans(model, ~ Tissu * Infected)
+  
+  # ---- Compact letter display ----
+  cld_res <- multcomp::cld(emm, Letters = letters) %>%
+    as.data.frame()
+  cld_res$maxval = max(df_sub$Value)
+  # ---- Plot ----
+  p <- ggplot(df_sub,
+              aes(x = Tissu,
+                  y = Value,
+                  fill = Infected)) +
+    
+    geom_violin(trim = FALSE) +
+    
+    geom_jitter(position = position_jitterdodge(
+      dodge.width = 0.8,
+      jitter.width = 0.6),
+      size = 1.5) +
+    
+    geom_text(data = cld_res,
+              aes(x = Tissu,
+                  y = maxval+10,
+                  label = .group,
+                  group = Infected),
+              position = position_dodge(0.8),
+              inherit.aes = FALSE,
+              size = 5) +
+    labs(x = "Vine tissue",
+         y = measure,
+         title = measure) +
+    scale_fill_brewer(palette = "Accent") +
+    theme_classic() +
+    theme(text = element_text(size = 14))
+  
+  plot_list_fungi[[measure]] <- p
+}
+
+plot_list_fungi[[1]]
+plot_list_fungi[[2]]
+plot_list_fungi[[3]]
+```
+
+### Beta-diversity
+
+```{r, results = 'hide',  message=FALSE, warning=FALSE }
+#########Beta diversity 
+# Betadiversity Analysis by tissue as principal group
+#"Tissu"
+#Bacteria
+MBV16S_mt$cal_betadiv()
+bact.beta <- trans_beta$new(dataset = MBV16S_mt, group = "Tissu", measure = "bray")
+
+bact.beta$cal_ordination(method = "PCoA")
+# $res_ordination is the ordination result list
+
+#bacteria plot by tissue
+bact.beta$plot_ordination(plot_color = "Tissu", plot_shape = "Tissu", plot_type = c("point", "ellipse"))+
+  theme_classic() +
+  theme(text = element_text(size = 14))
+
+#Fungal
+MBVITS_mt$sample_table = MBVITS_mt$sample_table %>%
+  filter(Tissu != "Racine")
+MBVITS_mt$tidy_dataset()
+
+MBVITS_abun <- trans_abund$new(dataset = MBVITS_mt)
+MBVITS_mt$cal_betadiv()
+
+fung.beta <- trans_beta$new(dataset = MBVITS_mt, group = "Tissu", measure = "bray")
+
+fung.beta$cal_ordination(method = "PCoA")
+# t1$res_ordination is the ordination result list
+
+
+#envfit (community-level effects) bacteria
+#Ordination 
+ord_scores_bact <- scores(bact.beta$res_ordination, display = "sites")
+
+MBVenvi.data.vars<-ord_scores_bact[,c(19:20,27:38)]
+MBVenvi.data.vars$dysbiosis <- dysbiosis_results_bacteria$dysbiosisOOBRF$oob.score
+# Fit environmental data
+
+fit_bact <- envfit(ord_scores_bact[,c(1:2)], MBVenvi.data.vars, permutations = 999, na.rm = TRUE)
+#fit_bact_sig<-data.frame(fit_bact$vectors)
+
+# Extract the arrow coordinates
+# These are the x and y directions of the arrows
+arrows_bact <- as.data.frame(scores(fit_bact, display = "vectors"))
+arrows_bact$r <- fit_bact$vectors$r
+arrows_bact$pvals <- fit_bact$vectors$pvals
+arrows_bact$vars <- rownames(arrows_bact)
+arrows_bact_sig <- arrows_bact[which(arrows_bact$pvals < 0.06),]
+# Multiply arrows by a factor so they are visible 
+# (sometimes they are too small/large relative to the points)
+scaling_factor <- 0.8 
+arrows_bact[,1:2] <- arrows_bact[,1:2] * scaling_factor
+
+#envfit (community-level effects) fungi
+#Ordination 
+ord_scores_fung <- scores(fung.beta$res_ordination, display = "sites")
+
+
+MBVenvi.data.vars.fung<-ord_scores_fung[,c(19:20,27:38)]
+
+dysbiosis_results_fungi$dysbiosisOOBRF = dysbiosis_results_fungi$dysbiosisOOBRF %>%
+  filter(Tissu != "Racine")
+MBVenvi.data.vars.fung$dysbiosis <- dysbiosis_results_fungi$dysbiosisOOBRF$oob.score
+ord_scores_fung$dysbiosisOOBRF = dysbiosis_results_fungi$dysbiosisOOBRF$oob.score
+# Fit environmental datas
+
+fit_fung <- envfit(ord_scores_fung[,c(1:2)], MBVenvi.data.vars.fung, permutations = 999, na.rm = TRUE)
+
+
+# Extract the arrow coordinates
+# These are the x and y directions of the arrows
+arrows_fung <- as.data.frame(scores(fit_fung, display = "vectors"))
+arrows_fung$r <- fit_fung$vectors$r
+arrows_fung$pvals <- fit_fung$vectors$pvals
+arrows_fung$vars <- rownames(arrows_fung)
+arrows_fung_sig <- arrows_bact[which(arrows_fung$pvals < 0.06),]
+# Multiply arrows by a factor so they are visible 
+# (sometimes they are too small/large relative to the points)
+scaling_factor <- 0.8 
+arrows_fung[,1:2] <- arrows_fung[,1:2] * scaling_factor
+# plot the PCoA result with confidence ellipse
+#for bacteria and fingi
+ggarrange(bact.beta$plot_ordination(plot_color = "Tissu", plot_shape = "Tissu", plot_type = c("point", "ellipse"))+
+            geom_segment(data = arrows_bact_sig, 
+                         aes(x = 0, y = 0, xend = PCo1, yend = PCo2), 
+                         arrow = arrow(length = unit(0.2, "cm")), 
+                         color = "black", inherit.aes = FALSE) +
+            geom_text(data = arrows_bact_sig, 
+                      aes(x = PCo1 * 1.1, y = PCo2 * 1.1, label = vars), 
+                      color = "black", fontface = "bold", inherit.aes = FALSE) +
+  theme_classic() +
+  theme(text = element_text(size = 14)), fung.beta$plot_ordination(plot_color = "Tissu", plot_shape = "Tissu", plot_type = c("point", "ellipse"))+
+    geom_segment(data = arrows_fung_sig, 
+                aes(x = 0, y = 0, xend = PCo1, yend = PCo2), 
+                arrow = arrow(length = unit(0.2, "cm")), 
+                color = "black", inherit.aes = FALSE) +
+    geom_text(data = arrows_fung_sig, 
+              aes(x = PCo1 * 1.1, y = PCo2 * 1.1, label = vars), 
+              color = "black", fontface = "bold", inherit.aes = FALSE) +
+    theme_classic() +
+  theme(text = element_text(size = 14)), ncol = 2, labels = c("Bacteria", " Fungi"), common.legend = TRUE, legend = "right")
+
+
+#### Loop for generating ordination plots by tissues
+
+# Define tissues
+tissues <- c("Cordon", "Courson.Sarment", "Ecorce.Chancre")
+MBV16S_mt$sample_table$dysbiosis <- dysbiosis_results_bacteria$dysbiosisOOBRF$oob.score
+
+
+# Empty list to store plots for bacteria
+ordination_plots_bact <- list()
+
+for (tissue in tissues) {
+  
+  # Filter sample table
+  sub_micro <-clone(MBV16S_mt)
+  sub_micro$sample_table <- subset(sub_micro$sample_table, Tissu == tissue)
+  sub_micro$cal_betadiv()
+  bact.beta.sub <- trans_beta$new(dataset = sub_micro, group = "Infected", measure = "bray")
+  
+  bact.beta.sub$cal_ordination(method = "PCoA")
+    # Optional: inspect tidy dataset
+  df <- sub_micro$tidy_dataset
+  print(paste(tissue, "samples:", nrow(df)))
+  #enfit
+  #Ordination 
+  ord_scores_bact <- scores(bact.beta.sub$res_ordination, display = "sites")
+  
+  MBVenvi.data.vars<-ord_scores_bact[,c(19:20,27,29:38,43)]
+  # 2. Fit environmental datas
+  
+  fit_bact <- envfit(ord_scores_bact[,c(1:2)], MBVenvi.data.vars, permutations = 999, na.rm = TRUE)
+  # 3. Extract the arrow coordinates
+  # These are the x and y directions of the arrows
+  arrows_bact <- as.data.frame(scores(fit_bact, display = "vectors"))
+  arrows_bact$r <- fit_bact$vectors$r
+  arrows_bact$pvals <- fit_bact$vectors$pvals
+  arrows_bact$vars <- rownames(arrows_bact)
+  arrows_bact_sigt <- arrows_bact[which(arrows_bact$pvals < 0.06),]
+  # 4. Optional: Multiply arrows by a factor so they are visible 
+  # (sometimes they are too small/large relative to the points)
+  scaling_factor <- 0.8 
+  arrows_bact_sigt[,1:2] <- arrows_bact_sigt[,1:2] * scaling_factor
+# Generate ordination plot
+  p <- bact.beta.sub$plot_ordination(
+    plot_color = "Infected",
+    plot_shape = "Infected",
+    plot_type = c("point", "ellipse")
+  )+
+    geom_segment(data = arrows_bact_sigt, 
+                 aes(x = 0, y = 0, xend = PCo1, yend = PCo2), 
+                 arrow = arrow(length = unit(0.2, "cm")), 
+                 color = "black", inherit.aes = FALSE) +
+    geom_text(data = arrows_bact_sigt, 
+              aes(x = PCo1 * 1.1, y = PCo2 * 1.1, label = vars), 
+              color = "black", fontface = "bold", inherit.aes = FALSE) +
+    labs(title = tissue) +
+    scale_color_brewer(palette = "Accent") +
+    theme_classic() +
+    theme(text = element_text(size = 16))
+  
+  # Store in list
+  ordination_plots_bact[[tissue]] <- p
+}
+
+# display the Cordon plot
+ordination_plots_bact$Cordon
+ordination_plots_bact$Courson.Sarment
+ordination_plots_bact$Ecorce.Chancre
+
+# Empty list to store plots for fungi
+MBVITS_mt$sample_table$dysbiosis <- dysbiosis_results_fungi$dysbiosisOOBRF$oob.score
+
+
+ordination_plots_fung <- list()
+
+for (tissue in tissues) {
+  # Filter sample table
+  sub_micro <-clone(MBVITS_mt)
+  sub_micro$sample_table <- subset(sub_micro$sample_table, Tissu == tissue)
+  sub_micro$cal_betadiv()
+  fung.beta.sub <- trans_beta$new(dataset = sub_micro, group = "Infected", measure = "bray")
+  
+  fung.beta.sub$cal_ordination(method = "PCoA")
+  # Optional: inspect tidy dataset
+  df <- sub_micro$tidy_dataset
+  print(paste(tissue, "samples:", nrow(df)))
+  #enfit
+  #Ordination 
+  ord_scores_fung <- scores(fung.beta.sub$res_ordination, display = "sites")
+  colnames(ord_scores_fung)
+  MBVenvi.data.vars<-ord_scores_fung[,c(19:20,27,29:38,41)]
+  # Fit environmental datas
+  fit_fung <- envfit(ord_scores_fung[,c(1:2)], MBVenvi.data.vars, permutations = 999, na.rm = TRUE)
+  # 3. Extract the arrow coordinates
+  # These are the x and y directions of the arrows
+  arrows_fung <- as.data.frame(scores(fit_fung, display = "vectors"))
+  arrows_fung$r <- fit_fung$vectors$r
+  arrows_fung$pvals <- fit_fung$vectors$pvals
+  arrows_fung$vars <- rownames(arrows_fung)
+  arrows_fung_sigt <- arrows_fung[which(arrows_fung$pvals < 0.06),]
+  #  Multiply arrows by a factor so they are visible 
+  # (sometimes they are too small/large relative to the points)
+  scaling_factor <- 0.8 
+  arrows_fung_sigt[,1:2] <- arrows_fung_sigt[,1:2] * scaling_factor
+  # Generate ordination plot
+  p <- fung.beta.sub$plot_ordination(
+    plot_color = "Infected",
+    plot_shape = "Infected",
+    plot_type = c("point", "ellipse")
+  )+
+    geom_segment(data = arrows_fung_sigt, 
+                 aes(x = 0, y = 0, xend = PCo1, yend = PCo2), 
+                 arrow = arrow(length = unit(0.2, "cm")), 
+                 color = "black", inherit.aes = FALSE) +
+    geom_text(data = arrows_fung_sigt, 
+              aes(x = PCo1 * 1.1, y = PCo2 * 1.1, label = vars), 
+              color = "black", fontface = "bold", inherit.aes = FALSE) +
+    xlim(-0.75, NA)+labs(title = tissue) +
+    scale_color_brewer(palette = "Accent") +
+    theme_classic() +
+    theme(text = element_text(size = 16))
+  
+  # Store in list
+  ordination_plots_fung[[tissue]] <- p
+}
+
+# display the Cordon plot
+
+ordination_plots_fung$Cordon
+ordination_plots_fung$Courson.Sarment
+ordination_plots_fung$Ecorce.Chancre
+```
+
+#### Betadiversity statistical analyses and ordination distances within groups
+
+```{r, results = 'hide',  message=FALSE, warning=FALSE  }
+
+# calculate and plot sample distances within groups
+
+# Empty list to store plots for bacteria
+distance_plots_bact <- list()
+
+for (tissue in tissues) {
+  # Filter sample table
+  sub_micro <-clone(MBV16S_mt)
+  sub_micro$sample_table <- subset(sub_micro$sample_table, Tissu == tissue)
+  sub_micro$cal_betadiv()
+  bact.beta.sub <- trans_beta$new(dataset = sub_micro, group = "Infected", measure = "bray")
+  bact.beta.sub$cal_group_distance(within_group = TRUE)
+  bact.beta.sub$cal_group_distance_diff(method = "wilcox")
+  # plot_group_order parameter can be used to adjust orders in x axis
+  # Store in list
+  distance_plots_bact[[tissue]] <- bact.beta.sub$plot_group_distance(add = "mean")+
+    labs(title = tissue) +
+    scale_color_brewer(palette = "Accent") +
+    theme_classic() +
+    theme(text = element_text(size = 14))
+}  
+#fungi
+distance_plots_fung <- list()
+
+for (tissue in tissues) {
+  
+  # Filter sample table
+  sub_micro <-clone(MBVITS_mt)
+  sub_micro$sample_table <- subset(sub_micro$sample_table, Tissu == tissue)
+  sub_micro$cal_betadiv()
+  fung.beta.sub <- trans_beta$new(dataset = sub_micro, group = "Infected", measure = "bray")
+  fung.beta.sub$cal_group_distance(within_group = TRUE)
+  fung.beta.sub$cal_group_distance_diff(method = "wilcox")
+  # plot_group_order parameter can be used to adjust orders in x axis
+  # Store in list
+  distance_plots_fung[[tissue]] <- fung.beta.sub$plot_group_distance(add = "mean")+
+    labs(title = tissue) +
+    scale_color_brewer(palette = "Accent") +
+    theme_classic() +
+    theme(text = element_text(size = 14))
+}
+
+ggarrange(ggarrange(plotlist = distance_plots_bact, nrow = 1, ncol = 3, common.legend = TRUE), 
+          ggarrange(plotlist = distance_plots_fung,nrow = 1, ncol = 3, common.legend = TRUE), 
+          nrow = 2, labels = c("A", "B"))
+
+
+bact.beta$cal_group_distance(within_group = FALSE)
+
+# perform Wilcoxon Rank Sum and Signed Rank Tests
+bact.beta$cal_group_distance_diff(method = "wilcox")
+
+# calculate and plot sample distances within groups
+fung.beta$cal_group_distance(within_group = TRUE)
+# perform Wilcoxon Rank Sum and Signed Rank Tests
+fung.beta$cal_group_distance_diff(method = "wilcox")
+
+# Bacteria
+# Permanova
+bact.beta$cal_manova(manova_all = FALSE, group = "Tissu", by_group = "Infected")
+## Multivariate homogeneity of groups dispersions (variances)
+bact.beta$cal_betadisper()
+bact.beta$res_betadisper
+#Fungi
+#Permanova
+fung.beta$cal_manova(manova_all = FALSE, group = "Tissu", by_group = "Infected")
+fung.beta$res_manova
+## Multivariate homogeneity of groups dispersions (variances)
+#
+fung.beta$cal_betadisper()
+fung.beta$res_betadisper
+#PERMANOVA
+# manova for all groups when manova_all = TRUE
+bact.beta$cal_manova(manova_all = TRUE)
+bact.beta$res_manova
+
+fung.beta$cal_manova(manova_all = TRUE)
+fung.beta$res_manova
+```
+
+### Differential abundance analyses
+
+```{r, results = 'hide',  message=FALSE, warning=FALSE }
+# Random forest feature selection
+# Tissue discriminate taxa
+# use Genus level for parameter taxa_level, if you want to use all taxa, change to "all"
+# nresam = 1 and boots = 1 represent no bootstrapping and use all samples directly
+#bacteria
+bact.diff.rf <- trans_diff$new(dataset = MBV16S_mt, method = "rf", group = "Tissu", taxa_level = "Genus")
+# plot the MeanDecreaseGini bar
+# group_order is designed to sort the groups
+g1b <- bact.diff.rf$plot_diff_bar(use_number = 1:20, group_order = NULL)+
+  theme_classic() +
+  theme(text = element_text(size = 16))
+# plot the abundance using same taxa in g1
+g2b <- bact.diff.rf$plot_diff_abund(group_order = NULL, select_taxa = bact.diff.rf$plot_diff_bar_taxa, plot_type = "barerrorbar", add_sig = FALSE, errorbar_addpoint = FALSE, errorbar_color_black = TRUE)+
+  theme_classic() +
+  theme(text = element_text(size = 16))
+# now the y axis in g1 and g2 is same, so we can merge them
+# remove g1 legend; remove g2 y axis text and ticks
+g1b <- g1b + theme(legend.position = "none")
+g2b <- g2b + theme(axis.text.y = element_blank(), axis.ticks.y = element_blank(), panel.border = element_blank())
+pb <- g1b %>% aplot::insert_right(g2b)
+pb
+
+#fungi
+fungi.diff.rf <- trans_diff$new(dataset = MBVITS_mt, method = "rf", group = "Tissu", taxa_level = "Genus")
+# plot the MeanDecreaseGres_diff# plot the MeanDecreaseGini bar
+# group_order is designed to sort the groups
+g1f <- fungi.diff.rf$plot_diff_bar(use_number = 1:20, group_order = NULL)
+# plot the abundance using same taxa in g1
+g2f <- fungi.diff.rf$plot_diff_abund(group_order = NULL, select_taxa = fungi.diff.rf$plot_diff_bar_taxa, plot_type = "barerrorbar", add_sig = FALSE, errorbar_addpoint = FALSE, errorbar_color_black = TRUE)
+# now the y axis in g1 and g2 is same, so we can merge them
+# remove g1 legend; remove g2 y axis text and ticks
+g1f <- g1f + theme(legend.position = "none")
+g2f <- g2f + theme(axis.text.y = element_blank(), axis.ticks.y = element_blank(), panel.border = element_blank())
+pf <- g1f %>% aplot::insert_right(g2f)
+pf
+
+bacterial_res_rf <- list()
+#filtering by tissue to identify differential taxa on infected vs healthy plants
+tissues <- c("Cordon", "Courson.Sarment", "Ecorce.Chancre")
+
+for (tissue in tissues) {
+  # Filter sample table
+  sub_microt <-clone(MBV16S_mt)
+  sub_microt$sample_table <- subset(sub_microt$sample_table, Tissu == tissue)
+  sub_microt$tidy_dataset()
+  bacterial_res_rf[[tissue]] <-  trans_diff$new(dataset = sub_microt, method = "rf", group = "Infected", taxa_level = "Genus", p_adjust_method = "none")
+}
+
+fungal_res_rf <- list()
+#filtering by tissue to identify differential taxa on infected vs healthy plants
+for (tissue in tissues) {
+  
+  # Filter sample table
+  sub_microt <-clone(MBVITS_mt)
+  sub_microt$sample_table <- subset(sub_microt$sample_table, Tissu == tissue)
+  sub_microt$tidy_dataset()
+  #fungal_res_rf[[tissue]] <-  trans_diff$new(dataset = sub_microt, method = "metagenomeSeq", group = "Infected", taxa_level = "Family", p_adjust_method = "none")
+  fungal_res_rf[[tissue]] <-  trans_diff$new(dataset = sub_microt, method = "rf", group = "Infected", taxa_level = "Genus", p_adjust_method = "none")
+}
+
+# plot fungal features descriminating healthy and symptomatic vines in Cordon tissue
+ggarrange(fungal_res_rf$Cordon$plot_diff_bar(color_values = "black")+ 
+            labs(title = "Cordon") +
+            #theme(legend.position = "none")+
+    scale_fill_brewer(palette = "Accent") +
+    theme_classic() +
+    theme(text = element_text(size = 16)), fungal_res_rf$Cordon$plot_diff_abund(coord_flip = F, use_number = c(1:2), group_order = NULL)+ 
+    scale_color_brewer(palette = "Accent") +
+    theme_classic() +
+    theme(text = element_text(size = 16)), ncol = 2, labels = c("A", "B"), common.legend = TRUE, legend = "right")
+
+
+
+
+```
+
+### Dysbiosis measure
+
+**Random Forest Prediction Based Score using the dysbiosisOBB function**
+
+```{r dysbiosis, results = 'hide',  message=FALSE, warning=FALSE}
+# Dysbiosis index
+# This analysis ask the question : how far does a sample fall from the references samples "healthy" microbial neighborhood?
+
+# Dysbiosis R package
+#it uses a phyloseq object so we need to transform
+
+tax_matbact <- as.matrix(MBV16S_mt$tax_table [,c(2:7)])
+MBV16S_ps = phyloseq(otu_table(MBV16S_mt$otu_table, taxa_are_rows = TRUE), tax_table(tax_matbact), sample_data(MBV16S_mt$sample_table))
+
+
+tax_mat <- as.matrix(MBVITS_mt$tax_table [,c(2:7)])
+MBVITS_ps = phyloseq(otu_table(MBVITS_mt$otu_table, taxa_are_rows = TRUE), tax_table(tax_mat), sample_data(MBVITS_mt$sample_table))
+subset_samples(MBVITS_ps, Tissu =="Cordon")
+
+#transform data
+totalb = median(sample_sums(MBV16S_ps))
+totalf = median(sample_sums(MBVITS_ps))
+standfb = function(x, t=totalb) round(t * (x / sum(x)))
+standff = function(x, t=totalf) round(t * (x / sum(x)))
+MBV16S_ps_ra = transform_sample_counts(MBV16S_ps, standfb)
+MBVITS_ps_ra = transform_sample_counts(MBVITS_ps, standff)
+#sampling sizes
+#table(sample_data(MBV16S_ps_ra)$Infected)
+#table(sample_data(MBVITS_ps_ra)$Infected)
+
+
+###
+#
+#Dysbiosis measures
+# Compare area under the curve
+# use one dataset and then save in a list at the end of the script for all indexes
+# REMEMBER change the phyloseq object to select eihter bacteria or fungal dataset
+##
+dist.mat <- phyloseq::distance(MBV16S_ps_ra, "bray")
+# get reference samples
+ref.samples <- sample_names(subset_samples(MBV16S_ps_ra, 
+                                           Infected == "Healthy"))
+# random forest prediction based score
+
+# data are relative abundances summed to 100 or
+# near 100 val
+dysbiosis.oob <- dysbiosisOBB(MBV16S_ps_ra,
+                              group_col = "Infected",
+                              case_label = "Infected",
+                              seed_value = 1235,
+                              add_tuneRF_params = list(ntreeTry=100,
+                                                       stepFactor=1.5,
+                                                       improve=0.01,
+                                                       trace=TRUE,
+                                                       dobest=FALSE),
+                              ntree = 100,
+                              plot_roc = TRUE)
+
+p5 <- plotDysbiosis(df=dysbiosis.oob,
+                    xvar="Infected",
+                    yvar="oob.score",
+                    colors=c(Infected="brown3", Healthy="steelblue"),
+                    show_points = FALSE)+
+  labs(x="", y="OOB Dysbiosis Score")
+p5
+
+###Gradrient plot
+
+# define gradient cols
+
+volcano <- c("#003f5c", "#58508d","#bc5090","#ff6361", "#ffa600")
+
+# RF OOB  
+p.obb <- plotDysbiosisGradient(df=dysbiosis.oob,
+                               score="oob.score",
+                               high_line = 0.5,
+                               # low_line = normobiosis_thres,
+                               group_var = "Infected",
+                               group_colors=c("Healthy" = "steelblue", 
+                                              "Infected"= "brown3"),
+                               point_size = 2,
+                               bg_colors = rev(volcano),
+                               jitter_width = 0.1) +
+  labs(y="Dysbiosis Score", subtitle = "RF OOB Probability") +
+  # adjust the x and y values to fit to plot
+  ggplot2::annotate("text", x = 0.7, y = 0.55,
+                    label = "OOB probability\n(0.5)", color="white")
+
+#Visualize dysbiosis scores
+ggarrange(plotDysbiosisGradient(df=dysbiosis_results_bacteria$dysbiosisOOBRF,
+                                score="oob.score",
+                                high_line = 0.5,
+                                # low_line = normobiosis_thres,
+                                group_var = "Infected",
+                                group_colors=c("Healthy" = "steelblue", 
+                                               "Infected"= "brown3"),
+                                point_size = 6,
+                                bg_colors = rev(volcano),
+                                jitter_width = 0.1) +
+            labs(y="Dysbiosis Score", x= "Vine Individuals", title = "Bacterial Endophyte", subtitle = "RF OOB Probability") +theme_classic() +
+            theme(text = element_text(size = 16))+
+            # adjust the x and y values to fit to plot
+            ggplot2::annotate("text", x = 0.7, y = 0.55,
+                              label = "OOB probability\n(0.5)", color="white"),
+plotDysbiosisGradient(df=dysbiosis_results_fungi$dysbiosisOOBRF,
+                      score="oob.score",
+                      high_line = 0.5,
+                      # low_line = normobiosis_thres,
+                      group_var = "Infected",
+                      group_colors=c("Healthy" = "steelblue", 
+                                     "Infected"= "brown3"),
+                      point_size = 6,
+                      bg_colors = rev(volcano),
+                      jitter_width = 0.1) +
+  labs(y="Dysbiosis Score", x= "Vine Individuals", title = "Fungal Endophyte", subtitle = "RF OOB Probability") +theme_classic() +
+  theme(text = element_text(size = 16))+
+  # adjust the x and y values to fit to plot
+  ggplot2::annotate("text", x = 0.7, y = 0.55,
+                    label = "OOB probability\n(0.5)", color="white"), common.legend = TRUE, legend = "right")
+
+
+### use interactive plot to identified samples metadata on the plot
+library(plotly)
+#install.packages("plotly")
+# Convert the ggplot object to an interactive plotly graph
+ggplotly(p.obb, originalData = TRUE)
+
+boxplot(dysbiosis.oob$oob.score~dysbiosis.oob$Tissu)
+
+```
+
+Mapping dysbiosis score across Québec vineyards
+
+```{r mapdysbiosis, results = 'hide',  message=FALSE, warning=FALSE}
+#Dysbiosis map
+#dysbiosis_results_bacteria$dysbiosisOOBRF
+bmeta_dys_inf <- subset(dysbiosis_results_bacteria$dysbiosisOOBRF, dysbiosis_results_bacteria$dysbiosisOOBRF$Infected == "Infected")
+
+fmeta_dys_inf <- subset(dysbiosis_results_fungi$dysbiosisOOBRF, dysbiosis_results_fungi$dysbiosisOOBRF$Infected == "Infected")
+
+ggplot() +
+  ggtitle("Bacterial endophyte")+
+  geom_sf(data = quebec_sf, fill = "lightblue", color = "black") +
+  coord_sf(xlim = c(-80, -70), ylim = c(44.8, 47.5), expand = FALSE)+
+  geom_point(data = bmeta_dys_inf,                   # Specify the points data
+             aes(x = Longitude.GPS, y = Latitude.GPS, shape=Pathologie, color = oob.score), # Map aesthetics for points
+             size = 3, alpha = 1)+
+  geom_jitter()+
+  scale_colour_gradient2(mid = "yellow", high = "red", na.value = NA, midpoint = 0.45)+
+  theme_minimal()
+
+ggplot() +
+  ggtitle("Fungal endophyte")+
+  geom_sf(data = quebec_sf, fill = "lightblue", color = "black") +
+    coord_sf(xlim = c(-80, -70), ylim = c(44.8, 47.5), expand = FALSE)+
+    geom_point(data = fmeta_dys_inf, aes(x = Longitude.GPS, y = Latitude.GPS, shape=Pathologie, color = oob.score), # Map aesthetics for points
+               size = 3, alpha = 1)+
+    geom_jitter()+
+    scale_colour_gradient2(mid = "yellow", high = "red", na.value = NA, midpoint = 0.45)+
+    theme_minimal()
+
+```
+
+### GTDs exploration of other important pathogens
+
+```{r, results = 'hide',  message=FALSE, warning=FALSE }
+
+library(magrittr)
+
+# Fungal pathogens
+table(MBVITS_mt$tax_table$Genus=="Phaeomoniella")
+table(MBVITS_mt$tax_table$Genus=="Diplodia")
+table(MBVITS_mt$tax_table$Genus=="Phomopsis")
+table(MBVITS_mt$tax_table$Genus=="Fusicoccum")
+table(MBVITS_mt$tax_table$Genus=="Phaeoacremonium")#present
+table(MBVITS_mt$tax_table$Genus=="Cadophora")#present
+table(MBVITS_mt$tax_table$Genus=="Cylindrocarpon")
+table(MBVITS_mt$tax_table$Genus=="Fusarium")#present
+table(MBVITS_mt$tax_table$Genus=="Phaeomoniella")
+
+#if this are more present in infected plant than healthy plants
+#Neofusicoccum parvum
+#Diplodia mutila
+#Phomopsis viticola
+#Fusicoccum aesculi
+#Phaeoacremonium minimum
+#Cadophora melinii
+#Phaeomoniella chlamydospora
+#Cylindrocarpon
+#Fusarium oxysporum
+#data
+MBV16S_mt$cal_betadiv()
+# extract two phyla to show the steps
+d1 <- clone(MBVITS_mt)
+d1$tax_table <- d1$tax_table[d1$tax_table$Genus == "Phaeoacremonium", ]
+d1$tidy_dataset()
+d1$cal_betadiv()
+d2 <- clone(MBVITS_mt)
+d2$tax_table <- d2$tax_table[d2$tax_table$Genus == "Cadophora", ]
+d2$tidy_dataset()
+d2$cal_betadiv()
+
+d3 <- clone(MBVITS_mt)
+d3$tax_table <- d3$tax_table[d3$tax_table$Genus == "Fusarium", ]
+d3$tidy_dataset()
+d3$cal_betadiv()
+
+# first perform mantel test
+t1 <- trans_env$new(dataset = d1, env_cols = 28:36)
+t1$data_env <- na.omit(t1$data_env)
+t1$cal_mantel(use_measure = "bray", partial_mantel = TRUE)
+t2 <- trans_env$new(dataset = d2, env_cols = 8:15)
+t2$cal_mantel(use_measure = "bray", partial_mantel = TRUE)
+t3 <- trans_env$new(dataset = d3, env_cols = 8:15)
+t3$cal_mantel(use_measure = "bray", partial_mantel = TRUE)
+# extract a part of the results 
+x1 <- data.frame(spec = "Phaeoacremonium", t1$res_mantel) %>% .[, c(1, 3, 6, 8)]
+x2 <- data.frame(spec = "Cadophora", t2$res_mantel) %>% .[, c(1, 3, 6, 8)]
+x3 <- data.frame(spec = "Fusarium", t3$res_mantel) %>% .[, c(1, 3, 6, 8)]
+# rename columns
+colnames(x1) <- colnames(x2) <- colnames(x3)<- c("spec", "env", "r", "p.value")
+# generate interval data
+x1 <- dplyr::mutate(x1, rd = cut(r, breaks = c(-Inf, 0.3, 0.6, Inf), labels = c("< 0.3", "0.3 - 0.6", ">= 0.6")),
+                      pd = cut(p.value, breaks = c(-Inf, 0.01, 0.05, Inf), labels = c("< 0.01", "0.01 - 0.05", ">= 0.05")))
+x2 <- dplyr::mutate(x2, rd = cut(r, breaks = c(-Inf, 0.3, 0.6, Inf), labels = c("< 0.3", "0.3 - 0.6", ">= 0.6")),
+                      pd = cut(p.value, breaks = c(-Inf, 0.01, 0.05, Inf), labels = c("< 0.01", "0.01 - 0.05", ">= 0.05")))
+x3 <- dplyr::mutate(x3, rd = cut(r, breaks = c(-Inf, 0.3, 0.6, Inf), labels = c("< 0.3", "0.3 - 0.6", ">= 0.6")),
+                    pd = cut(p.value, breaks = c(-Inf, 0.01, 0.05, Inf), labels = c("< 0.01", "0.01 - 0.05", ">= 0.05")))
+# cobine two tables
+plot_table <- rbind(x1, x2, x3)
+# install ggcor following the steps (https://chiliubio.github.io/microeco_tutorial/intro.html#github-packages)
+library(ggplot2)
+
+#install.packages("GGally")
+
+library(GGally)
+
+library(ggplot2)
+
+ggplot(plot_table, aes(x = env, y = spec, fill = r)) +
+  geom_tile(color = "white") +
+  
+  # show correlation values
+  geom_text(aes(label = round(r, 2)), size = 3) +
+  
+  scale_fill_gradient2(
+    low = "blue",
+    mid = "white",
+    high = "red",
+    midpoint = 0,
+    limits = c(-1, 1),
+    name = "Correlation (r)"
+  ) +
+  
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    panel.grid = element_blank()
+  ) +
+  labs(x = "Environmental variables", y = "Taxa")
+
+ggplot(plot_table, aes(x = env, y = spec, fill = r)) +
+  geom_tile(color = "white") +
+  
+  geom_text(
+    aes(label = ifelse(p.value < 0.05, round(r, 2), "")),
+    size = 3
+  ) +
+  
+  scale_fill_gradient2(low = "blue", mid = "white", high = "red", midpoint = 0) +
+  
+  theme_classic() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+plot_table$stars <- ifelse(plot_table$p.value < 0.01, "***",
+                   ifelse(plot_table$p.value < 0.05, "**", ""))
+
+ggplot(plot_table, aes(x = env, y = spec, fill = r)) +
+  geom_tile(color = "white") +
+  
+  geom_text(aes(label = paste0(round(r, 2), stars)), size = 3) +
+  
+  scale_fill_gradient2(low = "blue", mid = "white", high = "red", midpoint = 0) +
+  
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+### Dysbiosis confusion matrix
+
+```{r, results = 'hide',  message=FALSE, warning=FALSE }
+#Confusion Matrix
+aggregate(CentroidDist_score~Infected,  data = dysbiosis_results_bacteria$dysbiosisEuclideandist,  FUN = mean)
+
+dysbiosis_results_bacteria$dysbiosisOOBRF <- dysbiosis_results_bacteria$dysbiosisOOBRF %>% 
+  mutate(OOBPredicted = if_else(oob.score >=0.5, "Infected", "Healthy"))
+
+dysbiosis_results_bacteria$dysbiosisOOBRF <- dysbiosis_results_bacteria$dysbiosisOOBRF %>% 
+  mutate(OOBPredicted = if_else(oob.score >=0.5, "Infected", "Healthy"))
+
+#calculate the mean
+aggregate(log2Stats~Infected,  data = dysbiosis_results_fungi$dysbiosisCLOUD,  FUN = mean)
+dysbiosis_results_fungi$dysbiosisOOBRF <- dysbiosis_results_fungi$dysbiosisOOBRF %>% 
+  mutate(OOBPredicted = if_else(oob.score >=0.5, "Infected", "Healthy"))
+
+dysbiosis_results_fungi$dysbiosisOOBRF <- dysbiosis_results_fungi$dysbiosisOOBRF %>% 
+  mutate(OOBPredicted = if_else(oob.score >=0.5, "Infected", "Healthy"))
+#install.packages("caret")
+library(caret)
+# 'data' is predicted classes, 'reference' is actual classes
+dysbiosis_results_bacteria$dysbiosisOOBRF$OOBPredicted <- as.factor(dysbiosis_results_bacteria$dysbiosisOOBRF$OOBPredicted)
+
+cmb <- confusionMatrix(data = dysbiosis_results_bacteria$dysbiosisOOBRF$OOBPredicted, reference = dysbiosis_results_bacteria$dysbiosisOOBRF$Infected)
+print(cmb)
+
+dysbiosis_results_fungi$dysbiosisOOBRF$OOBPredicted <- as.factor(dysbiosis_results_fungi$dysbiosisOOBRF$OOBPredicted)
+
+cmf <- confusionMatrix(data = dysbiosis_results_fungi$dysbiosisOOBRF$OOBPredicted, reference = dysbiosis_results_fungi$dysbiosisOOBRF$Infected)
+print(cmf)
+```
+
+### Ecological assembly processes
+
+```{r ecoa,  message=FALSE, warning=FALSE}
+#### ecological processes dominating the community assembly 
+var.data = data.frame(MBV16S_mt$sample_table)
+# generate trans_nullmodel object
+# as an example, we only use high abundance OTU with mean relative abundance > 0.0005
+t1 <- trans_nullmodel$new(MBV16S_mt, filter_thres = 0.0005, add_data = var.data)
+
+# RCbray only
+t1$cal_rcbray(runs = 1000)
+rc <- t1$res_rcbray
+
+process <- ifelse(rc > 0.95, "Dispersal limitation",
+                  ifelse(rc < -0.95, "Homogenizing dispersal",
+                         "Drift / Undominated"))
+
+
+library(reshape2)
+
+rc_mat <- t1$res_rcbray
+
+# convert to long format
+rc_long <- melt(rc_mat, varnames = c("Sample1", "Sample2"), value.name = "RCbray")
+
+# remove self-comparisons
+rc_long <- rc_long[rc_long$Sample1 != rc_long$Sample2, ]
+
+meta <- MBV16S_mt$sample_table
+
+meta$OOBPredicted <-dysbiosis_results_bacteria$dysbiosisOOBRF$oob.score 
+#meta$OOBPredicted <-dysbiosis_results_fungi$dysbiosisOOBRF$OOBPredicted
+
+rc_long$Tissue1 <- meta[rc_long$Sample1, "Tissu"]
+rc_long$Tissue2 <- meta[rc_long$Sample2, "Tissu"]
+
+rc_long$Health1 <- meta[rc_long$Sample1, "Infected"]   
+rc_long$Health2 <- meta[rc_long$Sample2, "Infected"]
+
+rc_long$PredHealth1 <- meta[rc_long$Sample1, "OOBPredicted"]   
+rc_long$PredHealth2 <- meta[rc_long$Sample2, "OOBPredicted"]
+#same tissue
+rc_long_tissue <- rc_long[rc_long$Tissue1 == rc_long$Tissue2, ]
+
+rc_long_group <- rc_long[
+  rc_long$Tissue1 == rc_long$Tissue2 &
+    rc_long$Health1 == rc_long$Health2 &
+    rc_long$PredHealth1 == rc_long$PredHealth2, ]
+
+#classify process
+rc_long_group$Process <- ifelse(rc_long_group$RCbray > 0.95, "Dispersal limitation",
+                                ifelse(rc_long_group$RCbray < -0.95, "Homogenizing dispersal",
+                                       "Drift / Undominated"))
+
+rc_long_group$Tissue <- rc_long_group$Tissue1
+rc_long_group$Health <- rc_long_group$Health1
+rc_long_group$PredHealth <- rc_long_group$PredHealth1
+
+
+summary_df <- rc_long_group %>%
+  group_by(Tissue, Health,  Process) %>%
+  summarise(n = n(), .groups = "drop") %>%
+  group_by(Tissue, Health) %>%
+  mutate(Percentage = 100 * n / sum(n))
+DT::datatable(summary_df)
+
+summary_df_pred <- rc_long_group %>%
+  group_by(Tissue, PredHealth, Process) %>%
+  summarise(n = n(), .groups = "drop") %>%
+  group_by(Tissue, PredHealth) %>%
+  mutate(Percentage = 100 * n / sum(n))
+DT::datatable(summary_df_pred)
+
+
+#fungi
+t2 <- trans_nullmodel$new(MBVITS_mt, filter_thres = 0.0005, add_data = var.data)
+
+# RCbray only
+t2$cal_rcbray(runs = 1000)
+rcf <- t2$res_rcbray
+
+processf <- ifelse(rcf > 0.95, "Dispersal limitation",
+                  ifelse(rc < -0.95, "Homogenizing dispersal",
+                         "Drift / Undominated"))
+
+rc_matf <- t2$res_rcbray
+
+# convert to long format
+rc_longf <- melt(rc_matf, varnames = c("Sample1", "Sample2"), value.name = "RCbray")
+
+metaf <- MBVITS_mt$sample_table
+metaf$OOBPredicted <-dysbiosis_results_fungi$dysbiosisOOBRF$oob.score[1:186]
+
+rc_longf$Tissue1 <- metaf[rc_longf$Sample1, "Tissu"]
+rc_longf$Tissue2 <- metaf[rc_longf$Sample2, "Tissu"]
+
+rc_longf$Health1 <- metaf[rc_longf$Sample1, "Infected"]   
+rc_longf$Health2 <- metaf[rc_longf$Sample2, "Infected"]
+
+rc_longf$PredHealth1 <- metaf[rc_longf$Sample1, "OOBPredicted"]  
+rc_longf$PredHealth2 <- metaf[rc_longf$Sample2, "OOBPredicted"]
+#same tissue
+rc_longf_tissue <- rc_longf[rc_longf$Tissue1 == rc_longf$Tissue2, ]
+
+rc_longf_group <- rc_longf[
+  rc_longf$Tissue1 == rc_longf$Tissue2 &
+    rc_longf$Health1 == rc_longf$Health2 &
+    rc_longf$PredHealth1 == rc_longf$PredHealth2, ]
+
+#classify process
+rc_longf_group$Process <- ifelse(rc_longf_group$RCbray > 0.95, "Dispersal limitation",
+                                ifelse(rc_longf_group$RCbray < -0.95, "Homogenizing dispersal",
+                                       "Drift / Undominated"))
+
+rc_longf_group$Tissue <- rc_longf_group$Tissue1
+rc_longf_group$Health <- rc_longf_group$Health1
+rc_longf_group$PredHealth <- rc_longf_group$PredHealth1
+
+
+summary_dff <- rc_longf_group %>%
+  group_by(Tissue, Health,  Process) %>%
+  summarise(n = n(), .groups = "drop") %>%
+  group_by(Tissue, Health) %>%
+  mutate(Percentage = 100 * n / sum(n))
+DT::datatable(summary_dff)
+
+summary_df_predf <- rc_longf_group %>%
+  group_by(Tissue, PredHealth, Process) %>%
+  summarise(n = n(), .groups = "drop") %>%
+  group_by(Tissue, PredHealth) %>%
+  mutate(Percentage = 100 * n / sum(n))
+DT::datatable(summary_df_predf)
+
+
+```
+
+### Structural Equation Modelling
+
+```{r sem,  message=FALSE, warning=FALSE, eval=FALSE}
+#SEM
+library(piecewiseSEM)
+
+#data
+library(dplyr)
+library(tidyr)
+
+alpha_bact <- MBV16S_alpha$data_alpha %>%
+  dplyr::filter(Measure %in% c("Observed", "Shannon_hill", "Simpson_hill")) %>%
+  dplyr::select(Sample, Measure, Value) %>%
+  tidyr::pivot_wider(
+    names_from = Measure,
+    values_from = Value
+  )
+
+alpha_fung <- MBVITS_alpha$data_alpha %>%
+  dplyr::filter(Measure %in% c("Observed", "Shannon_hill", "Simpson_hill")) %>%
+  dplyr::select(Sample, Measure, Value) %>%
+  tidyr::pivot_wider(
+    names_from = Measure,
+    values_from = Value
+  )
+colnames(ord_scores_bact)[3] <- "Sample"
+colnames(ord_scores_fung)[3] <- "Sample"
+alpha_bact <- alpha_bact %>% rename_with(~ paste0(.x, "_bact"), -Sample)
+alpha_fung <- alpha_fung %>% rename_with(~ paste0(.x, "_fung"), -Sample)
+dim(ord_scores_bact)
+
+dfbact <- ord_scores_bact %>%
+  left_join(alpha_bact, by = "Sample")
+dffung <-  ord_scores_fung %>%
+  left_join(alpha_fung, by = "Sample")
+
+colnames(dffung)[41]<-"dysbiosis"
+
+
+# Clean and select relevant variables
+df_clean <- dfbact %>%
+#  df_clean <- dffung %>%
+  dplyr::select(
+    Sample,
+    
+    # --- Environment (keep a few representative variables)
+    Mean.Temp,
+    Mean.humidity,
+    Mean.Wind.speed,
+    Latitude.GPS,
+    Longitude.GPS,
+    
+    # --- Pathogens
+    Eutypa.lata,
+    Diplodia.seriata,
+    
+    # --- Infection status
+    Infected,
+    
+    # --- Dysbiosis
+    dysbiosis,
+    
+    # --- Diversity bacteria
+    Observed_bact,
+    Shannon_hill_bact,
+    Simpson_hill_bact,
+    # --- Diversity fungi
+    #Observed_fung,
+    #Shannon_hill_fung,
+    #Simpson_hill_fung,
+    
+    # --- Community structure
+    PCo1,
+    PCo2
+  )
+
+
+#clean coordinates
+df_clean <- df_clean %>%
+  dplyr::select(-Latitude.GPS, -Longitude.GPS)
+str(df_clean)
+
+#combine pathogens into one latent variable
+df_clean$Eutypa.lata <- as.integer(df_clean$Eutypa.lata)
+df_clean$Pathogen_load = df_clean$Eutypa.lata + df_clean$Diplodia.seriata
+
+df_clean <- df_clean %>%
+  drop_na()
+
+
+#check collinearity
+df_num <- df_clean %>% dplyr::select(where(is.numeric))
+
+cor_mat <- cor(df_num)
+
+# inspect strong correlations
+which(abs(cor_mat) > 0.8, arr.ind = TRUE)
+
+#select variables
+#Bacteria
+df_clean.s <- df_clean %>%
+  dplyr::select(Mean.Temp, Mean.humidity, Mean.Wind.speed, dysbiosis, Shannon_hill_bact, PCo1, PCo2, Pathogen_load)
+#FUNGI
+df_clean.s <- df_clean %>%
+  dplyr::select(Mean.Temp, Mean.humidity, Mean.Wind.speed, dysbiosis, Shannon_hill_fung, PCo1, PCo2, Pathogen_load)
+
+
+df_scaled <- df_clean %>%
+  mutate(across(where(is.numeric), ~ as.numeric(scale(.))))
+
+
+#build SEM
+library(piecewiseSEM)
+
+m1 <- lm(dysbiosis ~ Mean.Temp + Mean.humidity + Mean.Wind.speed, data = df_scaled)
+
+m2 <- lm(Shannon_hill_bact ~ dysbiosis + Mean.Temp, data = df_scaled)
+m2 <- lm(Shannon_hill_fung ~ dysbiosis + Mean.Temp, data = df_scaled)
+
+m3 <- lm(Pathogen_load ~ dysbiosis + Mean.Temp, data = df_scaled)
+m4 <- lm(PCo1 ~ Mean.Temp + Mean.humidity, data = df_scaled)
+
+
+sem_model <- psem(m1, m2, m3, m4)
+
+summary(sem_model)
+
+library(lavaan)
+#install.packages("lavaan")
+#install.packages("semPlot")
+library(semPlot)
+
+#Define SEM structure
+model <- '
+  # Dysbiosis drivers
+  dysbiosis ~ Mean.Temp + Mean.humidity + Mean.Wind.speed
+
+  # Microbiome response
+  Shannon_hill_bact ~ dysbiosis + Mean.Temp
+
+  # Pathogens
+  Pathogen_load ~ dysbiosis + Mean.Temp
+  
+  # Community structure
+  PCo1 ~ Mean.Temp + Mean.humidity
+'
+
+fit <- sem(model, data = df_scaled)
+
+pe <- parameterEstimates(fit, standardized = TRUE)
+paths <- pe %>%
+  filter(op == "~") %>%
+  dplyr::select(lhs, rhs, est, pvalue)
+
+
+#build node layout
+nodes <- data.frame(
+  name = c("Mean.Temp", "Mean.humidity", "Mean.Wind.speed",
+           "dysbiosis",
+           "Shannon_hill_bact",
+           "Pathogen_load",
+           "PCo1"),
+  
+  x = c(1, 1, 1,
+        2,
+        3,
+        3,
+        2),
+  
+  y = c(3, 2, 1,
+        2,
+        3,
+        1,
+        1.5)
+)
+
+
+#build edges (with significance styling)
+
+edges <- paths %>%
+  mutate(
+    sig = ifelse(pvalue < 0.05, "sig", "ns")
+  )
+
+# Complete Graph Object
+#install.packages("tidygraph")
+library(tidygraph)
+#install.packages("ggraph")
+library(ggraph)
+param_graph <- tidygraph::tbl_graph(nodes, edges)
+
+fit <- sem(model, data = df_scaled)
+
+#ggplot2 SEM models with tidygraph and ggraph 
+#https://drsimonj.svbtle.com/ggsem-plot-sem-models-with-ggplot2
+# Plot a fitted lavaan object
+ggsem <- function(fit, layout = "circle") {
+  
+  # Extract standardized parameters
+  params <- lavaan::standardizedSolution(fit)
+  
+  # Edge properties
+  param_edges <- params %>% 
+    filter(op %in% c("=~", "~", "~~"), lhs != rhs, pvalue < .10) %>%
+    transmute(to = lhs,
+              from = rhs,
+              val = est.std,
+              type = dplyr::case_when(
+                op == "=~" ~ "loading",
+                op == "~"  ~ "regression",
+                op == "~~" ~ "correlation",
+                TRUE ~ NA_character_))
+  
+  # Identify latent variables for nodes
+  latent_nodes <- param_edges %>% 
+    filter(type == "loading") %>% 
+    distinct(to) %>% 
+    transmute(metric = to, latent = TRUE)
+  
+  # Node properties
+  param_nodes <- params %>% 
+    filter(lhs == rhs) %>% 
+    transmute(metric = lhs, e = est.std) %>% 
+    left_join(latent_nodes) %>% 
+    mutate(latent = if_else(is.na(latent), FALSE, latent))
+  
+  # Complete Graph Object
+  param_graph <- tidygraph::tbl_graph(param_nodes, param_edges)
+  
+  # Plot
+  ggraph(param_graph, layout = layout) +
+    # Latent factor Nodes
+    geom_node_point(aes(alpha = as.numeric(latent)),
+                    shape = 16, size = 14) +
+    geom_node_point(aes(alpha = as.numeric(latent)),
+                    shape = 16, size = 12, color = "white") +
+    # Observed Nodes
+    geom_node_point(aes(alpha = as.numeric(!latent)),
+                    shape = 15, size = 14) +
+    geom_node_point(aes(alpha = as.numeric(!latent)),
+                    shape = 15, size = 12, color = "white") +
+    # Regression Paths (and text)
+    geom_edge_link(aes(color = val, label = round(val, 2),
+                       alpha = as.numeric(type == "regression")),
+                   linetype = 1, angle_calc = "along", vjust = -.5,
+                   arrow = arrow(20, unit(.3, "cm"), type = "closed")) +
+    # Factor Loadings (no text)
+    geom_edge_link(aes(color = val, alpha = as.numeric(type == "loading")),
+                   linetype = 3, angle_calc = "along",
+                   arrow = arrow(20, unit(.3, "cm"), ends = "first", type = "closed")) +
+    # Correlation Paths (no text)
+    geom_edge_link(aes(color = val, alpha = as.numeric(type == "correlation")),
+                   linetype = 2, angle_calc = "along",
+                   arrow = arrow(20, unit(.3, "cm"), type = "closed", ends = "both")) +
+    # Node names
+    geom_node_text(aes(label = metric),
+                   nudge_y = .25, hjust = "inward") +
+    # Node residual error
+    geom_node_text(aes(label = sprintf("%.2f", e)),
+                   nudge_y = -.1, size = 14) +
+    # Scales and themes
+    scale_alpha(guide = FALSE, range = c(0, 1)) +
+    scale_edge_alpha(guide = FALSE, range = c(0, 1)) +
+    scale_edge_colour_gradient2(guide = FALSE, low = "red", mid = "darkgray", high = "green") +
+    scale_edge_linetype(guide = FALSE) +
+    scale_size(guide = FALSE) +
+    theme_graph()
+}
+
+#modified by me
+ggsem <- function(fit, layout = "tree") {
+  
+  # Extract standardized parameters
+  params <- lavaan::standardizedSolution(fit)
+  
+  # Edge properties
+  param_edges <- params %>% 
+    filter(op %in% c("=~", "~", "~~"), lhs != rhs, pvalue < .10) %>%
+    transmute(to = lhs,
+              from = rhs,
+              val = est.std,
+              type = dplyr::case_when(
+                op == "=~" ~ "loading",
+                op == "~"  ~ "regression",
+                op == "~~" ~ "correlation",
+                TRUE ~ NA_character_))
+  
+  # Identify latent variables for nodes
+  latent_nodes <- param_edges %>% 
+    filter(type == "loading") %>% 
+    distinct(to) %>% 
+    transmute(metric = to, latent = TRUE)
+  
+  # Node properties
+  param_nodes <- params %>% 
+    filter(lhs == rhs) %>% 
+    transmute(metric = lhs, e = est.std) %>% 
+    left_join(latent_nodes) %>% 
+    mutate(latent = if_else(is.na(latent), FALSE, latent))
+  
+  # Complete Graph Object
+  param_graph <- tidygraph::tbl_graph(param_nodes, param_edges)
+  
+  # Plot
+  ggraph(param_graph, layout = layout) +
+    # Latent factor Nodes
+    geom_node_point(aes(alpha = as.numeric(latent)),
+                    shape = 16, size = 8) +
+    geom_node_point(aes(alpha = as.numeric(latent)),
+                    shape = 16, size = 8, color = "white") +
+    # Observed Nodes
+    geom_node_point(aes(alpha = as.numeric(!latent)),
+                    shape = 15, size = 8) +
+    geom_node_point(aes(alpha = as.numeric(!latent)),
+                    shape = 15, size = 8, color = "white") +
+    # Regression paths
+    geom_edge_arc(
+      aes(color = val, label = round(val, 2),
+          alpha = as.numeric(type == "regression")),
+      strength = 0.4,
+      arrow = arrow(20, unit(.3, "cm"), type = "closed"),
+      label_size = 4
+    ) +
+    # Loadings
+    geom_edge_arc(
+      aes(color = val,
+          alpha = as.numeric(type == "loading")),
+      strength = 0.3,
+      linetype = 3,
+      arrow = arrow(20, unit(.3, "cm"), ends = "first", type = "closed")
+    ) +
+    # Correlations
+    geom_edge_arc(
+      aes(color = val,
+          alpha = as.numeric(type == "correlation")),
+      strength = 0.6,
+      linetype = 2,
+      arrow = arrow(20, unit(.3, "cm"), ends = "both", type = "closed")
+    ) +
+    # Node names
+    geom_node_text(aes(label = metric),
+                   nudge_y = .25, hjust = "inward") +
+    # Node residual error
+    geom_node_text(aes(label = sprintf("%.2f", e)),
+                   nudge_y = -.1, size = 10) +
+    # Scales and themes
+    scale_alpha(guide = FALSE, range = c(0, 1)) +
+    scale_edge_alpha(guide = FALSE, range = c(0, 1)) +
+    scale_edge_colour_gradient2(guide = FALSE, low = "red", mid = "darkgray", high = "green") +
+    scale_edge_linetype(guide = FALSE) +
+    scale_size(guide = FALSE) +
+    theme_graph()
+}
+
+#install.packages('ggsem')
+#plot SEM
+ggsem(fit)
+
+ggsem::ggsem(fit)
+
+
+# Diagram
+library(DiagrammeR)
+
+grViz("
+digraph SEM {
+  graph [layout = dot, rankdir = LR, overlap = false, splines = true]
+
+  # Node definitions with styles
+  node [shape = rectangle, style = filled, fillcolor = White, fontname = Helvetica, penwidth = 2]
+  
+  # Predictors (Left)
+  subgraph cluster_0 {
+    graph [peripheries = 0]
+    'Mean Temperature'; 'Mean humidity'; 'Mean Wind speed';
+  }
+
+  # Mediator (Middle)
+  'Dysbiosis';
+
+  # Responses (Right)
+  'Shannon Hill'; 'Pathogen Occurence'; 'PCo1';
+
+  # Edges from model string
+  'Mean Temperature' -> 'Dysbiosis'
+  'Mean humidity' -> 'Dysbiosis'
+  'Pathogen Occurence' -> 'Dysbiosis'
+  'PCo1' -> 'Dysbiosis'
+  
+  'Dysbiosis' -> 'Shannon Hill'
+  'Mean Temperature' -> 'Shannon Hill'
+  
+  'Dysbiosis' -> 'Pathogen Occurence'
+  'Mean Temperature' -> 'Pathogen Occurence'
+  
+  'Mean Temperature' -> 'PCo1'
+  'Mean humidity' -> 'PCo1'
+  'Mean Wind speed' -> 'PCo1'
+}
+")
+
+```
